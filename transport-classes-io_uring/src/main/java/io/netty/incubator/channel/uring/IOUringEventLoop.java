@@ -161,40 +161,37 @@ public final class IOUringEventLoop extends SingleThreadEventLoop {
             throw new AssertionError("Failed to submit EventFdRead. Result: " + initialFlushResult);
         }
 
+        boolean maybeMoreWork = true;
         for (;;) {
-            // Avoid blocking for as long as possible - loop until available work exhausted
-            boolean maybeMoreWork = true;
-            // pendingWakeup = false;
-            do {
-                try {
-                    // CQE processing can produce tasks, and new CQEs could arrive while
-                    // processing tasks. So run both on every iteration and break when
-                    // they both report that nothing was done (| means always run both).
-                    maybeMoreWork = completionQueue.process(callback) != 0 | runAllTasks();
-                } catch (Throwable t) {
-                    handleLoopException(t);
-                }
-                // Always handle shutdown even if the loop processing threw an exception
-                try {
-                    if (isShuttingDown()) {
-                        closeAll();
-                        if (confirmShutdown()) {
-                            return;
-                        }
-                        if (!maybeMoreWork) {
-                            maybeMoreWork = hasTasks() || completionQueue.hasCompletions();
-                        }
-                    }
-                } catch (Throwable t) {
-                    handleLoopException(t);
-                }
+            try {
+                // CQE processing can produce tasks, and new CQEs could arrive while
+                // processing tasks. So run both on every iteration and break when
+                // they both report that nothing was done (| means always run both).
+                maybeMoreWork = completionQueue.process(callback) != 0 | runAllTasks();
+            } catch (Throwable t) {
+                handleLoopException(t);
+            }
 
-                if (submissionQueue.count() > 0 && !isShuttingDown()) {
-                    maybeMoreWork = true;
+            // Always handle shutdown even if the loop processing threw an exception
+            try {
+                if (isShuttingDown()) {
+                    closeAll();
+                    if (confirmShutdown()) {
+                        return;
+                    }
+                    if (!maybeMoreWork) {
+                        maybeMoreWork = hasTasks() || completionQueue.hasCompletions();
+                    }
+                }
+            } catch (Throwable t) {
+                handleLoopException(t);
+            }
+
+            if (submissionQueue.count() > 0) {
+                if (!isShuttingDown() || !maybeMoreWork) {
                     submissionQueue.submit();
                 }
-
-            } while (maybeMoreWork);
+            }
         }
     }
 
