@@ -60,8 +60,6 @@ public final class IOUringEventLoop extends SingleThreadEventLoop {
     private final IOUringCompletionQueueCallback callback = IOUringEventLoop.this::handle;
     private final Runnable submitIOTask = () -> getRingBuffer().ioUringSubmissionQueue().submit();
 
-    private long prevDeadlineNanos = NONE;
-    private boolean pendingWakeup;
 
     IOUringEventLoop(IOUringEventLoopGroup parent, Executor executor, int ringSize, int iosqeAsyncThreshold,
                      RejectedExecutionHandler rejectedExecutionHandler, EventLoopTaskQueueFactory queueFactory) {
@@ -164,43 +162,9 @@ public final class IOUringEventLoop extends SingleThreadEventLoop {
         }
 
         for (;;) {
-            try {
-                logger.trace("Run IOUringEventLoop {}", this);
-
-                // Prepare to block wait
-                long curDeadlineNanos = nextScheduledTaskDeadlineNanos();
-                if (curDeadlineNanos == -1L) {
-                    curDeadlineNanos = NONE; // nothing on the calendar
-                }
-                nextWakeupNanos.set(curDeadlineNanos);
-
-                // Only submit a timeout if there are no tasks to process and do a blocking operation
-                // on the completionQueue.
-                try {
-                    if (!hasTasks()) {
-                        if (curDeadlineNanos != prevDeadlineNanos) {
-                            prevDeadlineNanos = curDeadlineNanos;
-                            submissionQueue.addTimeout(deadlineToDelayNanos(curDeadlineNanos), (short) 0);
-                        }
-
-                        // Check there were any completion events to process
-                        if (!completionQueue.hasCompletions()) {
-                            // Block if there is nothing to process after this try again to call process(....)
-                            logger.trace("submitAndWait {}", this);
-                            submissionQueue.submitAndWait();
-                        }
-                    }
-                } finally {
-                    if (nextWakeupNanos.get() == AWAKE || nextWakeupNanos.getAndSet(AWAKE) == AWAKE) {
-                        pendingWakeup = true;
-                    }
-                }
-            } catch (Throwable t) {
-                handleLoopException(t);
-            }
-
             // Avoid blocking for as long as possible - loop until available work exhausted
             boolean maybeMoreWork = true;
+            // pendingWakeup = false;
             do {
                 try {
                     // CQE processing can produce tasks, and new CQEs could arrive while
@@ -224,6 +188,12 @@ public final class IOUringEventLoop extends SingleThreadEventLoop {
                 } catch (Throwable t) {
                     handleLoopException(t);
                 }
+
+                if (submissionQueue.count() > 0 && !isShuttingDown()) {
+                    maybeMoreWork = true;
+                    submissionQueue.submit();
+                }
+
             } while (maybeMoreWork);
         }
     }
@@ -245,11 +215,9 @@ public final class IOUringEventLoop extends SingleThreadEventLoop {
 
     private void handle(int fd, int res, int flags, byte op, short data) {
         if (op == Native.IORING_OP_READ && eventfd.intValue() == fd) {
-            pendingWakeup = false;
             addEventFdRead(ringBuffer.ioUringSubmissionQueue());
         } else if (op == Native.IORING_OP_TIMEOUT) {
             if (res == Native.ERRNO_ETIME_NEGATIVE) {
-                prevDeadlineNanos = NONE;
             }
         } else {
             // Remaining events should be channel-specific
@@ -324,27 +292,6 @@ public final class IOUringEventLoop extends SingleThreadEventLoop {
     protected void cleanup() {
         IOUringCompletionQueue completionQueue = ringBuffer.ioUringCompletionQueue();
         IOUringSubmissionQueue submissionQueue = ringBuffer.ioUringSubmissionQueue();
-        if (pendingWakeup) {
-            // Another thread is in the process of writing to the eventFd. We must wait to
-            // receive the corresponding CQE before closing it or else the fd int may be
-            // reassigned by the kernel in the meantime.
-            IOUringCompletionQueueCallback callback = new IOUringCompletionQueueCallback() {
-                @Override
-                public void handle(int fd, int res, int flags, byte op, short data) {
-                    if (op == Native.IORING_OP_READ && eventfd.intValue() == fd) {
-                        pendingWakeup = false;
-                    } else {
-                        // Delegate to the original handle(...) method so we not miss some completions.
-                        IOUringEventLoop.this.handle(fd, res, flags, op, data);
-                    }
-                }
-            };
-            completionQueue.process(callback);
-            while (pendingWakeup) {
-                completionQueue.ioUringWaitCqe();
-                completionQueue.process(callback);
-            }
-        }
 
         // Call closeAll() one last time
         closeAll();
